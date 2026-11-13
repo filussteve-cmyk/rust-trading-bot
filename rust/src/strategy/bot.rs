@@ -180,6 +180,9 @@ impl BotState {
     }
 
     pub fn book_close(&mut self, price: f64, reason: &str, bar_idx: i64, size: u32, dir: &str) {
+        // Snap to the tick grid — real fills only occur at tick increments, so
+        // P&L must land on whole-tick multiples (e.g. $12.50 for ES)
+        let price = (price / self.instrument.tick_size).round() * self.instrument.tick_size;
         let normalized = normalize_exit_reason(reason);
         let pos_ep = self.pos.as_ref().map(|p| p.ep).unwrap_or(price);
         let ticks = if dir == "LONG" { (price - pos_ep) / self.instrument.tick_size } else { (pos_ep - price) / self.instrument.tick_size };
@@ -427,6 +430,9 @@ async fn handle_bar_event(
     if bot.trades_today >= MAX_TRADES { return; }
     if bot.entry_pending { return; }
     if bot.pos.is_some() { return; }
+
+    // Steve's hard daily loss limit — no new entries once hit
+    if bot.daily_pnl <= -MAX_DAILY_LOSS { return; }
 
     // Gutter daily loss guard
     let effective_dd = if bot.gutter_loss {

@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 ordered-float = { version = "4", features = ["serde"] }
 futures-util = "0.3"
 native-tls = "0.2"
+base64 = "0.22"
 tokio-native-tls = "0.3"
 rand = { version = "0.8", features = ["small_rng"] }
 is-terminal = "0.4"

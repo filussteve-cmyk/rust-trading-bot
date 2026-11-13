@@ -2,7 +2,6 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::USER_HUB;
@@ -53,8 +52,7 @@ async fn connect_and_stream(
         .to_string();
 
     let ws_url = format!("wss://rtc.topstepx.com/hubs/user?id={ct}&access_token={token}");
-    let (ws_stream, _) = connect_async(&ws_url).await?;
-    let (mut write, mut read) = ws_stream.split();
+    let (mut write, mut read) = crate::feed::proxy_ws::connect_ws_split(&ws_url).await?;
 
     // Handshake
     write.send(Message::Text(format!(r#"{{"protocol":"json","version":1}}{SIGNALR_SEP}"#))).await?;

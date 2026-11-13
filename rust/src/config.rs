@@ -2,8 +2,8 @@
 pub const API: &str = "https://api.topstepx.com/api";
 pub const HUB: &str = "https://rtc.topstepx.com/hubs/market";
 pub const USER_HUB: &str = "https://rtc.topstepx.com/hubs/user";
-pub const CONTRACT: &str = "CON.F.US.EP.U26";
-pub const NQ_CONTRACT: &str = "CON.F.US.ENQ.U26";
+pub const CONTRACT: &str = "CON.F.US.EP.Z26";
+pub const NQ_CONTRACT: &str = "CON.F.US.ENQ.Z26";
 pub const NQ_TICK_VALUE: f64 = 5.0;
 pub const VX_CONTRACT: &str = "CON.F.US.VX.M26";
 pub const DATA_DIR: &str = "es_sessions";
@@ -13,10 +13,11 @@ pub const DAYS_BACK: u32 = 35;
 // Strategy
 pub const BOT_ACTIVE: bool = true;
 pub const DRY_RUN: bool = true;
+pub const MAX_DAILY_LOSS: f64 = 1000.0; // Steve's daily loss limit (practice account)
 pub const TARGET_MODE: &str = "vwap"; // "vwap" or "volume"
 pub const Z_THRESH: f64 = 1.2;
 pub const CONTRACTS: u32 = 1;
-pub const MAX_TRADES: u32 = 11;
+pub const MAX_TRADES: u32 = u32::MAX; // Unlimited — Steve Nov 13: "leave it unlimited" (supersedes the 20/day standing cap)
 pub const MAX_HOURLY_LOSS: f64 = 200.0;
 pub const HOURLY_GUARD_TYPE: &str = "DD"; // "PL" or "DD"
 pub const ATR_STOP_RATIO: f64 = 0.80;

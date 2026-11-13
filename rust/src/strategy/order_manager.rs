@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::api::auth::TokenHandle;
 use crate::api::orders::OrderClient;
 use crate::api::positions::{close_action_from_side, search_open};
-use crate::config::{CONTRACTS, SYNC_INTERVAL_SECS};
+use crate::config::{CONTRACTS, SYNC_INTERVAL_SECS, TICK_SIZE};
 use crate::types::{AppState, Direction, FillEvent, ServerPositionState, TradeCommand};
 
 pub async fn run(
@@ -132,9 +132,11 @@ async fn handle_command(
 
             if is_dry {
                 tracing::info!("[DRY RUN] Enter {dir:?} @ ~{entry_price:.2} SL={sl_price:.2} TP={tp_price:.2}");
+                // Snap simulated fill to the tick grid — real fills only occur at tick increments
+                let fill_price = (entry_price / TICK_SIZE).round() * TICK_SIZE;
                 let _ = fill_tx.send(FillEvent::Entered {
                     pos_uuid,
-                    fill_price: entry_price,
+                    fill_price,
                     dir,
                     sl: sl_price,
                     tp: tp_price,
@@ -517,8 +519,10 @@ async fn sync_from_server(
             tracing::debug!("sync_from_server: unknown state — skipping");
         }
         Ok(ServerPositionState::Flat) => {
-            // Rebase daily P&L from broker once per 60s while flat
-            if !bot_has_pos && last_rebase.elapsed() >= std::time::Duration::from_secs(60) {
+            // Rebase daily P&L from broker once per 60s while flat.
+            // Live mode only: in dry-run there are no broker fills, so rebasing
+            // would wipe the simulated P&L back to zero every minute.
+            if !is_dry && !bot_has_pos && last_rebase.elapsed() >= std::time::Duration::from_secs(60) {
                 *last_rebase = std::time::Instant::now();
                 let today_start = chrono::Utc::now().format("%Y-%m-%dT00:00:00.000Z").to_string();
                 match crate::api::trades::search(client, &bearer, account_id, &today_start, None).await {
@@ -540,9 +544,12 @@ async fn sync_from_server(
                 }
             }
 
-            if bot_has_pos {
+            if !is_dry && bot_has_pos {
                 // Bot thinks open, server is flat — SL or TP bracket filled externally.
                 // Cancel the surviving bracket leg before notifying the bot.
+                // (Live mode only: in dry-run the server is always flat because no
+                // real orders are sent, so this would force-close every simulated
+                // position within seconds.)
                 tracing::info!("sync_from_server: server flat but bot has position → ExternalClose");
                 let dir = state.read().await.bot.pos.as_ref().map(|p| {
                     if p.dir == "LONG" { Direction::Long } else { Direction::Short }
