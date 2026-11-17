@@ -22,6 +22,12 @@ pub async fn run(
     // Skip the first immediate tick
     sync_interval.tick().await;
 
+    // Startup sweep: a previous instance may have died after a bracket filled
+    // (or with a stale entry limit working), leaving working orders on a flat
+    // account. Cancel them before trading so nothing survives from the dead
+    // instance. Live only.
+    startup_sweep(&client, &token, account_id, &contract_id, &state).await;
+
     // Track orphan position confirmations: (consecutive_confirmations, last_avg_price)
     let mut orphan_confirm: u32 = 0;
     // Track the current known position uuid (set on Entered, cleared on Closed)
@@ -47,6 +53,39 @@ pub async fn run(
                 ).await;
             }
         }
+    }
+}
+
+async fn startup_sweep(
+    client: &reqwest::Client,
+    token: &Arc<RwLock<TokenHandle>>,
+    account_id: i64,
+    contract_id: &str,
+    state: &Arc<RwLock<AppState>>,
+) {
+    if state.read().await.dry_run {
+        return;
+    }
+    let bearer = token.read().await.bearer();
+    let oc = OrderClient {
+        client,
+        bearer: bearer.clone(),
+        account_id,
+        contract_id: contract_id.to_string(),
+    };
+    match search_open(client, &bearer, account_id, contract_id).await {
+        Ok(ServerPositionState::Flat) => match oc.cancel_all_working_orders().await {
+            Ok(ids) if !ids.is_empty() => tracing::warn!(
+                "Startup sweep: cancelled {} working order(s) left on flat account: {:?}",
+                ids.len(), ids
+            ),
+            Ok(_) => tracing::info!("Startup sweep: flat account, no working orders"),
+            Err(e) => tracing::warn!("Startup sweep: order lookup failed: {e}"),
+        },
+        Ok(ServerPositionState::Open { .. }) => {
+            tracing::warn!("Startup sweep: server has an open position — leaving it for sync reconcile");
+        }
+        _ => tracing::warn!("Startup sweep: position state unknown — skipping"),
     }
 }
 
@@ -268,7 +307,22 @@ async fn handle_command(
                     return;
                 }
                 Ok(ServerPositionState::Flat) => {
-                    // Position already closed externally
+                    // Position already closed externally (SL/TP bracket filled).
+                    // Cancel the surviving bracket leg FIRST: SL and TP are
+                    // independent explicit orders, so the unfilled leg is still
+                    // working on a flat account and can open an unintended
+                    // position if left behind. (Live only: in dry-run the
+                    // server is always flat and no real orders exist.)
+                    if !is_dry {
+                        match oc.cancel_all_working_orders().await {
+                            Ok(ids) if !ids.is_empty() => tracing::info!(
+                                "Exit: server already flat — cancelled {} surviving working order(s): {:?}",
+                                ids.len(), ids
+                            ),
+                            Ok(_) => tracing::debug!("Exit: server already flat — no working orders to cancel"),
+                            Err(e) => tracing::warn!("Exit: cancel of surviving orders failed: {e}"),
+                        }
+                    }
                     tracing::info!("Exit: server already flat (external close detected)");
                     *active_pos_uuid = None;
                     *orphan_confirm = 0;
@@ -590,6 +644,17 @@ async fn sync_from_server(
                         .unwrap_or("SELL");
 
                     if !is_dry {
+                        // Cancel brackets first: the orphan position's SL/TP are
+                        // still working, and a market close alone leaves them
+                        // behind on a flat account (Nov 16 trade #6).
+                        match oc.cancel_all_working_orders().await {
+                            Ok(ids) if !ids.is_empty() => tracing::info!(
+                                "sync_from_server: orphan close — cancelled {} surviving working order(s): {:?}",
+                                ids.len(), ids
+                            ),
+                            Ok(_) => {},
+                            Err(e) => tracing::warn!("sync_from_server: orphan cancel failed: {e}"),
+                        }
                         let ref_price = if let Some(p) = avg_price {
                             p
                         } else {

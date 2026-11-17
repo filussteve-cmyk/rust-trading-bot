@@ -320,4 +320,36 @@ impl<'a> OrderClient<'a> {
         }
         Ok(())
     }
+
+    /// Cancel every working order for this contract on this account, any
+    /// side/type (SL + TP brackets, plus any stale entry limit). Used when a
+    /// position closes by any path and at startup: SL and TP are independent
+    /// explicit orders, so a flat account must have zero working orders or the
+    /// survivor can open an unintended position. Returns the cancelled ids.
+    pub async fn cancel_all_working_orders(&self) -> Result<Vec<i64>> {
+        let orders = self.active_orders().await?;
+        let mut cancelled = Vec::new();
+        for o in &orders {
+            if o["contractId"].as_str().unwrap_or("") == self.contract_id
+                && matches!(o["status"].as_i64(), Some(0) | Some(1))
+            {
+                let oid = o["id"].as_i64().unwrap_or(0);
+                let otype = o["type"].as_i64().unwrap_or(-1);
+                let side = o["side"].as_i64().unwrap_or(-1);
+                match self.cancel(oid).await {
+                    Ok(true) => {
+                        tracing::info!("Cancelled surviving working order id={oid} type={otype} side={side}");
+                        cancelled.push(oid);
+                    }
+                    Ok(false) => tracing::warn!(
+                        "Cancel rejected for surviving working order id={oid} type={otype} side={side}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Cancel failed for surviving working order id={oid}: {e}"
+                    ),
+                }
+            }
+        }
+        Ok(cancelled)
+    }
 }
