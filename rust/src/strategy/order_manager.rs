@@ -5,9 +5,38 @@ use uuid::Uuid;
 
 use crate::api::auth::TokenHandle;
 use crate::api::orders::OrderClient;
-use crate::api::positions::{close_action_from_side, search_open};
+use crate::api::positions::{close_action_from_side, direction_from_side, search_open};
 use crate::config::{CONTRACTS, SYNC_INTERVAL_SECS, TICK_SIZE};
 use crate::types::{AppState, Direction, FillEvent, ServerPositionState, TradeCommand};
+
+/// Cap a close order at the bot's configured position size. Nov 18, 2026:
+/// the exit path re-read the server position on every retry and ordered
+/// that size, so wrong-way fills escalated the close 1 → 2 → 4 contracts.
+/// A close attempt must never exceed the size the bot itself opened.
+fn capped_close_size(server_size: u32) -> u32 {
+    server_size.min(CONTRACTS).max(1)
+}
+
+/// Decide how to close a server-reported open position.
+/// Returns None when the side value is not a recognized broker position
+/// type (1 = Long, 2 = Short) — the caller must refuse rather than guess,
+/// because a guessed direction doubles the position instead of closing it.
+fn decide_close(
+    side: &Option<serde_json::Value>,
+    server_size: u32,
+) -> Option<(Direction, &'static str, u32)> {
+    let side = side.as_ref()?;
+    let dir = direction_from_side(side)?;
+    let action = close_action_from_side(side)?;
+    Some((dir, action, capped_close_size(server_size)))
+}
+
+/// True when an order-placement response reports success. Anything else
+/// (success=false, e.g. the Nov 18 stop rejection "Order price is outside
+/// allowed range", or a missing field) is a rejection.
+fn order_succeeded(resp: &serde_json::Value) -> bool {
+    resp["success"].as_bool().unwrap_or(false)
+}
 
 pub async fn run(
     client: Arc<reqwest::Client>,
@@ -34,6 +63,13 @@ pub async fn run(
     let mut active_pos_uuid: Option<Uuid> = None;
     // Throttle broker P&L rebase to once per 60s, only when flat
     let mut last_rebase = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    // Nov 18, 2026 patch — day-scoped safety halts, set by handle_command:
+    // entries_halted: a stop placement was rejected after an entry fill; the
+    //   position was flattened at market and no new entries are allowed today.
+    // exits_halted: a position check failed to decode; the exit retry loop is
+    //   stopped so no further close orders are sent blind.
+    let mut entries_halted = false;
+    let mut exits_halted = false;
 
     loop {
         tokio::select! {
@@ -42,6 +78,7 @@ pub async fn run(
                 handle_command(
                     &client, &token, account_id, &contract_id,
                     cmd, &fill_tx, &state, &mut active_pos_uuid, &mut orphan_confirm,
+                    &mut entries_halted, &mut exits_halted,
                 ).await;
             }
             _ = sync_interval.tick() => {
@@ -112,6 +149,8 @@ async fn handle_command(
     state: &Arc<RwLock<AppState>>,
     active_pos_uuid: &mut Option<Uuid>,
     orphan_confirm: &mut u32,
+    entries_halted: &mut bool,
+    exits_halted: &mut bool,
 ) {
     let is_dry = state.read().await.dry_run;
     let bearer = token.read().await.bearer();
@@ -127,6 +166,14 @@ async fn handle_command(
             dir, sl_price, tp_price, entry_price, entry_vwap,
             tp_buffer_ticks, bar_idx, atr: _,
         } => {
+            // Day halt (Nov 18 patch): a stop placement was rejected earlier
+            // today and the position had to be flattened — no new entries.
+            if *entries_halted {
+                tracing::error!("Enter: refused — entries are HALTED for the day (stop placement rejected earlier)");
+                let _ = fill_tx.send(FillEvent::Error("entries halted for the day (stop rejected)".into())).await;
+                return;
+            }
+
             // Local guard: active_pos_uuid is set immediately when we place an order,
             // long before the API propagates the fill — prevents duplicate entries
             // from rapid bar events while the first fill is still in-flight.
@@ -268,12 +315,79 @@ async fn handle_command(
 
             // Place SL and TP as explicit orders — no Auto OCO dependency.
             let close_action = if dir == Direction::Long { "SELL" } else { "BUY" };
-            match oc.place_stop(close_action, CONTRACTS, sl_price).await {
-                Ok(resp) if resp["success"].as_bool().unwrap_or(false) =>
-                    tracing::info!("SL placed @ {sl_price:.2} (id={})", resp["orderId"]),
-                Ok(resp) => tracing::warn!("SL order failed: {resp}"),
-                Err(e)   => tracing::warn!("SL order error: {e}"),
+            let sl_ok = match oc.place_stop(close_action, CONTRACTS, sl_price).await {
+                Ok(resp) if order_succeeded(&resp) => {
+                    tracing::info!("SL placed @ {sl_price:.2} (id={})", resp["orderId"]);
+                    true
+                }
+                Ok(resp) => {
+                    tracing::warn!("SL order failed: {resp}");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("SL order error: {e}");
+                    false
+                }
+            };
+
+            if !sl_ok {
+                // Nov 18 patch (spec item 2): a rejected/failed stop must
+                // NEVER leave the position sitting unprotected. Cancel any
+                // working orders, flatten at market immediately, halt new
+                // entries for the rest of the day, and surface it. On
+                // Nov 18, 2026 the SL @ 7348.00 was rejected ("Order price
+                // is outside allowed range") and the old code placed the TP
+                // anyway and traded on with no stop at all.
+                tracing::error!(
+                    "SL placement failed for {dir:?} @ {fill_price:.2} — flattening immediately and halting entries for the day"
+                );
+                match oc.cancel_all_working_orders().await {
+                    Ok(ids) if !ids.is_empty() => tracing::info!(
+                        "SL-failure flatten: cancelled {} working order(s): {:?}",
+                        ids.len(), ids
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("SL-failure flatten: cancel of working orders failed: {e}"),
+                }
+                // Single flatten attempt with the direction the bot itself
+                // opened (known, not guessed) — never a blind retry loop.
+                match oc.place_market(close_action, CONTRACTS, None, None, fill_price).await {
+                    Ok(resp) if order_succeeded(&resp) => {
+                        tracing::error!("Emergency flatten placed (id={})", resp["orderId"]);
+                    }
+                    Ok(resp) => {
+                        tracing::error!("Emergency flatten REJECTED: {resp} — position may still be open and UNPROTECTED");
+                    }
+                    Err(e) => {
+                        tracing::error!("Emergency flatten error: {e} — position may still be open and UNPROTECTED");
+                    }
+                }
+                sleep(Duration::from_millis(500)).await;
+                match search_open(client, &bearer, account_id, contract_id).await {
+                    Ok(ServerPositionState::Flat) => {
+                        tracing::error!("Emergency flatten verified: account flat");
+                    }
+                    Ok(ServerPositionState::Open { size, .. }) => {
+                        tracing::error!(
+                            "Emergency flatten FAILED: server still shows open size={size} — manual intervention required"
+                        );
+                    }
+                    Ok(ServerPositionState::Unknown) => {
+                        tracing::error!("Emergency flatten verification inconclusive (unknown state) — check the account manually");
+                    }
+                    Err(e) => {
+                        tracing::error!("Emergency flatten verification failed ({e}) — check the account manually");
+                    }
+                }
+                *entries_halted = true;
+                *active_pos_uuid = None;
+                *orphan_confirm = 0;
+                let _ = fill_tx.send(FillEvent::Error(
+                    "stop placement rejected — position flattened at market, entries halted for the day".into(),
+                )).await;
+                return;
             }
+
             match oc.place_limit(close_action, CONTRACTS, tp_price).await {
                 Ok(resp) if resp["success"].as_bool().unwrap_or(false) =>
                     tracing::info!("TP placed @ {tp_price:.2} (id={})", resp["orderId"]),
@@ -296,10 +410,32 @@ async fn handle_command(
         }
 
         TradeCommand::Exit { pos_uuid, reason, price: ref_price, bar_idx } => {
+            // Nov 18 patch (spec item 3): once a position check has failed
+            // to decode, exit attempts stop for the day. The strategy keeps
+            // sending Exit on every tick while it holds a position; dropping
+            // the commands here is what stops the retry loop — no position
+            // checks, no orders. The trip itself was logged once, loudly.
+            if *exits_halted {
+                tracing::debug!("Exit: dropped — exits halted after a position-check failure");
+                return;
+            }
+
             // Check if we actually have a position
             match search_open(client, &bearer, account_id, contract_id).await {
                 Err(e) => {
-                    tracing::warn!("Exit: position check failed ({e}) — skip");
+                    // Nov 18 patch (spec item 3): a failed position check
+                    // (Nov 18: 397× "error decoding response body") must STOP
+                    // the exit retry loop instead of skipping and letting the
+                    // next tick fire another attempt blind. The position's
+                    // server-side SL/TP brackets remain in place; surface the
+                    // halt for the watch/human and send no further closes.
+                    *exits_halted = true;
+                    tracing::error!(
+                        "Exit: position check failed ({e}) — HALTING all exit attempts for the day; no further close orders will be sent. Manual intervention required."
+                    );
+                    let _ = fill_tx.send(FillEvent::Error(
+                        format!("position check failed — exits halted for the day: {e}"),
+                    )).await;
                     return;
                 }
                 Ok(ServerPositionState::Unknown) => {
@@ -335,33 +471,29 @@ async fn handle_command(
                     return;
                 }
                 Ok(ServerPositionState::Open { size, side, .. }) => {
-                    // Cancel brackets first
-                    let dir_guess = side.as_ref().and_then(|s| {
-                        if let Some(n) = s.as_i64() {
-                            Some(if n == 0 { Direction::Long } else { Direction::Short })
-                        } else if let Some(st) = s.as_str() {
-                            match st.to_uppercase().as_str() {
-                                "LONG" | "BUY" | "B" => Some(Direction::Long),
-                                _ => Some(Direction::Short),
-                            }
-                        } else {
-                            None
+                    // Nov 18 patch (spec items 1 + 4): derive direction and
+                    // close action from the broker position type with the
+                    // corrected mapping (1 = Long → SELL, 2 = Short → BUY).
+                    // The old code read type 1 (a real long) as Short and
+                    // "closed" it with BUY orders, doubling the position.
+                    // An unrecognized side value is a hard refuse: a guessed
+                    // direction can double the position instead of closing
+                    // it, so send NO order and leave the brackets in place.
+                    let (dir, close_action, close_size) = match decide_close(&side, size) {
+                        Some(v) => v,
+                        None => {
+                            tracing::error!(
+                                "Exit: unrecognized server position side {side:?} — refusing to guess a direction; no close order sent"
+                            );
+                            return;
                         }
-                    });
+                    };
 
-                    if let Some(dir) = dir_guess {
-                        if let Err(e) = oc.cancel_all_brackets(dir).await {
-                            tracing::warn!("cancel_all_brackets failed: {e}");
-                        }
+                    // Cancel brackets first (correct direction now, so the
+                    // right legs are cancelled)
+                    if let Err(e) = oc.cancel_all_brackets(dir).await {
+                        tracing::warn!("cancel_all_brackets failed: {e}");
                     }
-
-                    // Place closing market order
-                    let close_action = side
-                        .as_ref()
-                        .and_then(|s| close_action_from_side(s))
-                        .unwrap_or(if ref_price > 0.0 { "SELL" } else { "BUY" });
-
-                    let close_size = size.max(1);
 
                     if is_dry {
                         tracing::info!("[DRY RUN] Exit @ {ref_price:.2} reason={reason}");
@@ -635,13 +767,25 @@ async fn sync_from_server(
                 );
 
                 if *orphan_confirm >= 3 {
+                    // Nov 18 patch (spec items 1 + 4): never guess an
+                    // orphan's direction — the old fallback closed with
+                    // "SELL" whenever the side was unreadable, which for a
+                    // real short would double the position. An unrecognized
+                    // side leaves the position untouched for manual review.
+                    // Size is capped at the bot's configured size.
+                    let close = side.as_ref().and_then(|s| {
+                        close_action_from_side(s).map(|a| (a, capped_close_size(size)))
+                    });
+                    let Some((close_action, close_size)) = close else {
+                        tracing::error!(
+                            "sync_from_server: orphan position side {side:?} is not a recognized broker position type — refusing to guess a close direction; leaving it for manual review"
+                        );
+                        *orphan_confirm = 0;
+                        return;
+                    };
+
                     tracing::warn!("sync_from_server: auto-closing orphan position");
                     *orphan_confirm = 0;
-
-                    let close_action = side
-                        .as_ref()
-                        .and_then(|s| close_action_from_side(s))
-                        .unwrap_or("SELL");
 
                     if !is_dry {
                         // Cancel brackets first: the orphan position's SL/TP are
@@ -660,7 +804,7 @@ async fn sync_from_server(
                         } else {
                             state.read().await.live.last
                         };
-                        if let Err(e) = oc.place_market(close_action, size.max(1), None, None, ref_price).await {
+                        if let Err(e) = oc.place_market(close_action, close_size, None, None, ref_price).await {
                             tracing::error!("Orphan close failed: {e}");
                         }
                     } else {
@@ -686,5 +830,73 @@ async fn publish_active_orders(
             let _ = fill_tx.send(FillEvent::ActiveOrders(orders)).await;
         }
         Err(e) => tracing::debug!("active_orders poll failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn forced_long_exit_closes_with_sell() {
+        // Broker position type 1 = Long → close SELL, size 1.
+        let side = Some(json!(1));
+        assert_eq!(decide_close(&side, 1), Some((Direction::Long, "SELL", 1)));
+    }
+
+    #[test]
+    fn forced_short_exit_closes_with_buy() {
+        // Broker position type 2 = Short → close BUY, size 1.
+        let side = Some(json!(2));
+        assert_eq!(decide_close(&side, 1), Some((Direction::Short, "BUY", 1)));
+    }
+
+    #[test]
+    fn grown_server_size_never_escalates_the_close() {
+        // Nov 18, 2026: retries re-read the grown position and ordered
+        // 1 → 2 → 4. The close size is capped at the configured size.
+        let side = Some(json!(1));
+        assert_eq!(decide_close(&side, 4), Some((Direction::Long, "SELL", 1)));
+        assert_eq!(capped_close_size(0), 1);
+        assert_eq!(capped_close_size(1), 1);
+        assert_eq!(capped_close_size(2), 1);
+        assert_eq!(capped_close_size(4), 1);
+    }
+
+    #[test]
+    fn unknown_side_refuses_to_close() {
+        // No order may be sent when the direction cannot be determined.
+        assert_eq!(decide_close(&Some(json!(0)), 1), None);
+        assert_eq!(decide_close(&Some(json!(3)), 1), None);
+        assert_eq!(decide_close(&Some(json!("SIDEWAYS")), 1), None);
+        assert_eq!(decide_close(&None, 1), None);
+    }
+
+    #[test]
+    fn string_side_forms_close_correctly() {
+        assert_eq!(
+            decide_close(&Some(json!("LONG")), 1),
+            Some((Direction::Long, "SELL", 1))
+        );
+        assert_eq!(
+            decide_close(&Some(json!("SHORT")), 1),
+            Some((Direction::Short, "BUY", 1))
+        );
+    }
+
+    #[test]
+    fn rejected_stop_payload_is_not_success() {
+        // The actual Nov 18, 2026 SL rejection shape — this is the payload
+        // that must trigger the flatten-and-halt path in the Enter handler.
+        let rejected = json!({
+            "errorCode": 2,
+            "errorMessage": "Order price is outside allowed range. Please set price below best ask.",
+            "orderId": 3779486499i64,
+            "success": false,
+        });
+        assert!(!order_succeeded(&rejected));
+        assert!(order_succeeded(&json!({ "success": true, "orderId": 123 })));
+        assert!(!order_succeeded(&json!({})));
     }
 }

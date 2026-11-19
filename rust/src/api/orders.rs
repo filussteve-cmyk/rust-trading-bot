@@ -1,7 +1,22 @@
 use anyhow::Result;
 use reqwest::Client;
+use uuid::Uuid;
 use crate::config::{API, DRY_RUN};
 use crate::types::Direction;
+
+/// Build a custom order tag that is unique per attempt. The broker rejects a
+/// reused tag ("Specified custom tag is already in use"), and the old
+/// second-resolution timestamp tags collided whenever two orders landed in
+/// the same second (seen Nov 18, 2026 during the exit retry storm). Millis
+/// plus a random suffix make collisions practically impossible.
+fn unique_tag(prefix: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let suffix = Uuid::new_v4().simple().to_string();
+    format!("{prefix}_{millis}_{}", &suffix[..8])
+}
 
 pub struct OrderClient<'a> {
     pub client: &'a Client,
@@ -20,10 +35,6 @@ impl<'a> OrderClient<'a> {
         ref_price: f64,
     ) -> Result<serde_json::Value> {
         let side = if action.to_uppercase() == "BUY" { 0 } else { 1 };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
 
         // Account has Auto OCO Brackets enabled — sending bracket fields in the
         // order request is rejected by the platform ("Brackets cannot be used
@@ -37,7 +48,7 @@ impl<'a> OrderClient<'a> {
             "type": 2,
             "side": side,
             "size": size,
-            "customTag": format!("B_{ts}"),
+            "customTag": unique_tag("B"),
         });
 
         tracing::info!("ORDER -> {action} {size} @ MKT | ref={ref_price:.2} sl={sl_price:?} tp={tp_price:?}");
@@ -76,10 +87,6 @@ impl<'a> OrderClient<'a> {
         limit_price: f64,
     ) -> Result<serde_json::Value> {
         let side = if action.to_uppercase() == "BUY" { 0 } else { 1 };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let p = serde_json::json!({
             "accountId": self.account_id,
             "contractId": self.contract_id,
@@ -87,7 +94,7 @@ impl<'a> OrderClient<'a> {
             "side": side,
             "size": size,
             "limitPrice": limit_price,
-            "customTag": format!("ENTRY_{ts}"),
+            "customTag": unique_tag("ENTRY"),
         });
         tracing::info!("ENTRY LIMIT -> {action} {size} @ {limit_price:.2}");
         if DRY_RUN {
@@ -113,10 +120,6 @@ impl<'a> OrderClient<'a> {
         stop_price: f64,
     ) -> Result<serde_json::Value> {
         let side = if action.to_uppercase() == "BUY" { 0 } else { 1 };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let p = serde_json::json!({
             "accountId": self.account_id,
             "contractId": self.contract_id,
@@ -124,7 +127,7 @@ impl<'a> OrderClient<'a> {
             "side": side,
             "size": size,
             "stopPrice": stop_price,
-            "customTag": format!("SL_{ts}"),
+            "customTag": unique_tag("SL"),
         });
         tracing::info!("BRACKET SL -> {action} {size} Stop @ {stop_price:.2}");
         if DRY_RUN {
@@ -150,10 +153,6 @@ impl<'a> OrderClient<'a> {
         limit_price: f64,
     ) -> Result<serde_json::Value> {
         let side = if action.to_uppercase() == "BUY" { 0 } else { 1 };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let p = serde_json::json!({
             "accountId": self.account_id,
             "contractId": self.contract_id,
@@ -161,7 +160,7 @@ impl<'a> OrderClient<'a> {
             "side": side,
             "size": size,
             "limitPrice": limit_price,
-            "customTag": format!("TP_{ts}"),
+            "customTag": unique_tag("TP"),
         });
         tracing::info!("BRACKET TP -> {action} {size} Limit @ {limit_price:.2}");
         if DRY_RUN {
@@ -351,5 +350,24 @@ impl<'a> OrderClient<'a> {
             }
         }
         Ok(cancelled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_tags_never_collide_within_same_second() {
+        // Nov 18, 2026: two close orders inside one second reused the tag
+        // "B_<secs>" and the second was rejected as a duplicate. Tags must
+        // be unique per attempt even in rapid succession.
+        let a = unique_tag("B");
+        let b = unique_tag("B");
+        let c = unique_tag("B");
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert!(a.starts_with("B_"));
     }
 }

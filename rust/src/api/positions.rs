@@ -1,7 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use crate::config::API;
-use crate::types::ServerPositionState;
+use crate::types::{Direction, ServerPositionState};
 
 pub async fn search_open(
     client: &Client,
@@ -109,20 +109,95 @@ pub async fn partial_close_contract(
     Ok(resp["success"].as_bool().unwrap_or(false))
 }
 
-/// Returns the close action ("BUY" or "SELL") from a server-side position side value.
-pub fn close_action_from_side(side: &serde_json::Value) -> Option<&'static str> {
+/// Map a server-side position side/type value to a position direction.
+///
+/// Broker convention (Position/searchOpen "type" field, verified Nov 18, 2026
+/// against a raw dump of a known long position): **1 = Long, 2 = Short**.
+/// These are POSITION-type values — do not confuse them with trade-side
+/// values (0 = buy, 1 = sell). The old code assumed 0 = Long / 1 = Short,
+/// which made every real long (type 1) read as a short and produced the
+/// wrong-way BUY "close" orders of Nov 18, 2026.
+///
+/// Any other value returns None: callers must NOT guess a direction.
+pub fn direction_from_side(side: &serde_json::Value) -> Option<Direction> {
     if let Some(n) = side.as_i64() {
-        // 0 = Long → close with SELL; 1 = Short → close with BUY
-        return Some(if n == 0 { "SELL" } else { "BUY" });
+        return match n {
+            1 => Some(Direction::Long),
+            2 => Some(Direction::Short),
+            _ => None,
+        };
     }
     if let Some(s) = side.as_str() {
-        let u = s.to_uppercase();
-        if ["LONG", "BUY", "B"].contains(&u.as_str()) {
-            return Some("SELL");
-        }
-        if ["SHORT", "SELL", "S"].contains(&u.as_str()) {
-            return Some("BUY");
-        }
+        return match s.to_uppercase().as_str() {
+            "LONG" | "BUY" | "B" => Some(Direction::Long),
+            "SHORT" | "SELL" | "S" => Some(Direction::Short),
+            _ => None,
+        };
     }
     None
+}
+
+/// Returns the close action ("BUY" or "SELL") from a server-side position
+/// side value: a Long closes with SELL, a Short closes with BUY.
+/// Returns None for any unrecognized value — never guess.
+pub fn close_action_from_side(side: &serde_json::Value) -> Option<&'static str> {
+    match direction_from_side(side) {
+        Some(Direction::Long) => Some("SELL"),
+        Some(Direction::Short) => Some("BUY"),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn long_type_1_closes_with_sell() {
+        assert_eq!(direction_from_side(&json!(1)), Some(Direction::Long));
+        assert_eq!(close_action_from_side(&json!(1)), Some("SELL"));
+    }
+
+    #[test]
+    fn short_type_2_closes_with_buy() {
+        assert_eq!(direction_from_side(&json!(2)), Some(Direction::Short));
+        assert_eq!(close_action_from_side(&json!(2)), Some("BUY"));
+    }
+
+    #[test]
+    fn zero_is_unknown_not_long() {
+        // Regression test for the Nov 18, 2026 bug: the old mapping treated
+        // 0 as Long and every other value (including a real long, type 1)
+        // as Short. 0 is a trade-side value (buy), not a position type.
+        assert_eq!(direction_from_side(&json!(0)), None);
+        assert_eq!(close_action_from_side(&json!(0)), None);
+    }
+
+    #[test]
+    fn other_numbers_are_unknown() {
+        for v in [json!(3), json!(-1), json!(100)] {
+            assert_eq!(direction_from_side(&v), None);
+            assert_eq!(close_action_from_side(&v), None);
+        }
+    }
+
+    #[test]
+    fn string_forms() {
+        assert_eq!(close_action_from_side(&json!("LONG")), Some("SELL"));
+        assert_eq!(close_action_from_side(&json!("SHORT")), Some("BUY"));
+        assert_eq!(close_action_from_side(&json!("long")), Some("SELL"));
+        assert_eq!(close_action_from_side(&json!("short")), Some("BUY"));
+        assert_eq!(direction_from_side(&json!("LONG")), Some(Direction::Long));
+        assert_eq!(direction_from_side(&json!("SHORT")), Some(Direction::Short));
+    }
+
+    #[test]
+    fn garbage_and_null_are_unknown() {
+        assert_eq!(direction_from_side(&json!(null)), None);
+        assert_eq!(close_action_from_side(&json!(null)), None);
+        assert_eq!(direction_from_side(&json!("SIDEWAYS")), None);
+        assert_eq!(close_action_from_side(&json!("SIDEWAYS")), None);
+        assert_eq!(direction_from_side(&json!(1.5)), None);
+    }
 }
