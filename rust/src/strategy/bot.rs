@@ -481,6 +481,13 @@ async fn handle_bar_event(
                 Direction::Short => { if sl_price <= bar.price { return; } }
                 Direction::Long  => { if sl_price >= bar.price { return; } }
             }
+            // Skip entries whose structural stop is too wide (Nov 21, 2026 —
+            // fills analysis: the >=$100 loss tail came from wide prev-bar stops)
+            let stop_ticks = stop_ticks(sl_price, bar.price, tick_size);
+            if stop_ticks > MAX_ENTRY_STOP_TICKS {
+                tracing::info!("VWAP RECLAIM {dir:?} SKIPPED — stop {stop_ticks:.1} ticks exceeds max {MAX_ENTRY_STOP_TICKS:.0}");
+                return;
+            }
 
             tracing::info!("VWAP RECLAIM {dir:?} | SL={sl_price:.2} TP={tp_price:.2} atr={atr:.2}");
             bot.entry_signal_price = bar.price;
@@ -669,9 +676,10 @@ async fn handle_tick_event(
                     let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: tl }).await;
                 }
             }
-            // Breakeven
+            // Breakeven — one tick past entry (Nov 21, 2026: exact-entry BE
+            // exits were 8 of 52 trades at $0.00 gross / -$3.78 net)
             if ur >= BREAKEVEN_TICKS && sl < ep {
-                let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: ep }).await;
+                let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: breakeven_stop(Direction::Long, ep, tick_size) }).await;
             }
             // TP drift update
             if entry_vwap > 0.0 && tp_buffer_ticks > 0.0 {
@@ -744,7 +752,7 @@ async fn handle_tick_event(
                 }
             }
             if ur >= BREAKEVEN_TICKS && sl > ep {
-                let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: ep }).await;
+                let _ = cmd_tx.send(TradeCommand::ModifyStop { pos_uuid, new_stop: breakeven_stop(Direction::Short, ep, tick_size) }).await;
             }
             if bt > TIME_STOP_MINS * 2 || bt > TIME_STOP_MINS || (bt > TIME_STOP_MINS / 2 && cur < -4.0) {
                 let _ = cmd_tx.send(TradeCommand::Exit { pos_uuid, reason: "TIME STOP".to_string(), price, bar_idx: tick.bar_idx }).await;
@@ -753,9 +761,27 @@ async fn handle_tick_event(
     }
 }
 
+/// Breakeven stop target: one tick past entry in the trade's favor
+/// (Nov 21, 2026 fills-analysis fix — exact-entry exits bled $3.78 each).
+fn breakeven_stop(dir: Direction, ep: f64, tick_size: f64) -> f64 {
+    match dir {
+        Direction::Long => ep + tick_size,
+        Direction::Short => ep - tick_size,
+    }
+}
+
+/// Initial stop width in ticks (entry price to stop price).
+fn stop_ticks(sl_price: f64, entry_price: f64, tick_size: f64) -> f64 {
+    (sl_price - entry_price).abs() / tick_size
+}
+
 fn classify_stop(dir: &str, ep: f64, sl: f64, tick_size: f64) -> String {
     let tol = tick_size * 0.25;
     if (sl - ep).abs() <= tol { return "BREAKEVEN STOP".to_string(); }
+    // The breakeven stop sits 1 tick past entry — still a breakeven exit,
+    // not a trail stop (Nov 21, 2026).
+    if dir == "LONG" && sl > ep && sl <= ep + tick_size + tol { return "BREAKEVEN STOP".to_string(); }
+    if dir != "LONG" && sl < ep && sl >= ep - tick_size - tol { return "BREAKEVEN STOP".to_string(); }
     match dir {
         "LONG" => if sl > ep { "TRAIL STOP" } else { "STOP LOSS" },
         _ => if sl < ep { "TRAIL STOP" } else { "STOP LOSS" },
@@ -769,4 +795,36 @@ pub fn normalize_exit_reason(reason: &str) -> String {
     let valid = ["STOP LOSS","TRAIL STOP","BREAKEVEN STOP","TARGET","TIME STOP",
                  "END OF RTH","GUTTER WIN","GUTTER LOSS","SERVER FILL","END OF DATA","UNKNOWN","SCALE OUT"];
     if valid.contains(&r) { r.to_string() } else { "UNKNOWN".to_string() }
+}
+
+#[cfg(test)]
+mod fills_fix_tests {
+    use super::*;
+
+    #[test]
+    fn breakeven_stop_is_one_tick_past_entry() {
+        assert_eq!(breakeven_stop(Direction::Long, 7000.00, 0.25), 7000.25);
+        assert_eq!(breakeven_stop(Direction::Short, 7000.00, 0.25), 6999.75);
+    }
+
+    #[test]
+    fn classify_stop_breakeven_band_covers_one_tick_past_entry() {
+        // New BE placement (1 tick past entry) still classifies as breakeven.
+        assert_eq!(classify_stop("LONG", 7000.00, 7000.25, 0.25), "BREAKEVEN STOP");
+        assert_eq!(classify_stop("SHORT", 7000.00, 6999.75, 0.25), "BREAKEVEN STOP");
+        // Exact entry remains breakeven; genuine trails/stops unaffected.
+        assert_eq!(classify_stop("LONG", 7000.00, 7000.00, 0.25), "BREAKEVEN STOP");
+        assert_eq!(classify_stop("LONG", 7000.00, 7001.00, 0.25), "TRAIL STOP");
+        assert_eq!(classify_stop("SHORT", 7000.00, 6999.00, 0.25), "TRAIL STOP");
+        assert_eq!(classify_stop("LONG", 7000.00, 6998.00, 0.25), "STOP LOSS");
+        assert_eq!(classify_stop("SHORT", 7000.00, 7002.00, 0.25), "STOP LOSS");
+    }
+
+    #[test]
+    fn stop_ticks_math() {
+        assert_eq!(stop_ticks(7003.50, 7000.00, 0.25), 14.0);
+        assert_eq!(stop_ticks(6996.50, 7000.00, 0.25), 14.0);
+        assert!(stop_ticks(7003.75, 7000.00, 0.25) > MAX_ENTRY_STOP_TICKS);
+        assert!(stop_ticks(7002.00, 7000.00, 0.25) < MAX_ENTRY_STOP_TICKS);
+    }
 }

@@ -23,6 +23,7 @@ pub const HOURLY_GUARD_TYPE: &str = "DD"; // "PL" or "DD"
 pub const ATR_STOP_RATIO: f64 = 0.80;
 pub const MIN_STOP_TICKS: i32 = 4;
 pub const MAX_STOP_TICKS: i32 = 12;
+pub const MAX_ENTRY_STOP_TICKS: f64 = 14.0; // ES VWAP Reclaim: skip entries whose structural stop exceeds this (Steve Nov 21, 2026 — fills-analysis fix)
 pub const TRAIL_ACTIVATE: f64 = 8.0;
 pub const TRAIL_DISTANCE: f64 = 4.0;
 pub const BREAKEVEN_TICKS: f64 = 6.0;
